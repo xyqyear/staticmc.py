@@ -1,10 +1,11 @@
-from server import MCServer
+import asyncio
+
+from server import Server
 
 
 def main():
-    server_thread = MCServer()
-    server_thread.start()
-    server_thread.join()
+    server = Server()
+    asyncio.run(server.start())
 
 
 if __name__ == "__main__":
