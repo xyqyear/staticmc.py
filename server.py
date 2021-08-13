@@ -46,7 +46,10 @@ class ProtocolReader:
 
 
 class BufferedProtocolReader:
-    def __init__(self, data: bytes):
+    def __init__(self, data: bytes = b""):
+        self.buffer = io.BytesIO(data)
+
+    def fill(self, data: bytes):
         self.buffer = io.BytesIO(data)
 
     def _read(self, length: int):
@@ -86,17 +89,7 @@ class BufferedProtocolReader:
         return self._unpack(">H")[0]
 
 
-class PacketBase:
-    @classmethod
-    def from_bytes(cls, data: bytes) -> "PacketBase":
-        return PacketBase()
-
-    @classmethod
-    def to_bytes(cls) -> bytes:
-        return b""
-
-
-class HandshakePacket(PacketBase):
+class HandshakePacket:
     def __init__(
         self,
         protocol_version: int,
@@ -110,12 +103,11 @@ class HandshakePacket(PacketBase):
         self.next_state = next_state
 
     @classmethod
-    def from_bytes(cls, data: bytes):
-        reader = BufferedProtocolReader(data)
-        protocol_version = reader.read_varint()
-        server_address = reader.read_string()
-        server_port = reader.read_uint16()
-        next_state_int = reader.read_varint()
+    def from_bytes_io(cls, buffer: BufferedProtocolReader):
+        protocol_version = buffer.read_varint()
+        server_address = buffer.read_string()
+        server_port = buffer.read_uint16()
+        next_state_int = buffer.read_varint()
         next_state: ProtocolState
         if next_state_int == 1:
             next_state = ProtocolState.STATUS
@@ -142,21 +134,46 @@ class Server:
     async def handle_connection(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
-        worker = ServerWorker(reader, writer)
-        asyncio.get_event_loop().create_task(worker.start())
+        connection_handler = ConnectionHandler(reader, writer)
+        asyncio.get_event_loop().create_task(connection_handler.start())
 
 
-class ServerWorker:
+class ConnectionHandler:
     def __init__(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
         self.reader = reader
         self.writer = writer
-        self.protocol_state = ProtocolState.HANDSHAKE
 
     async def start(self):
         protocol_reader = ProtocolReader(self.reader)
-        # TODO: packet dispatching
+        worker = Worker(self.writer)
+
         while True:
             packet_length = await protocol_reader.read_varint()
-            packet_data = await protocol_reader.read(packet_length)
+            packet_content = await protocol_reader.read(packet_length)
+            await worker.dispatch(packet_content)
+
+
+class Worker:
+    def __init__(self, writer: asyncio.StreamWriter) -> None:
+        self.writer = writer
+        self.protocol_state = ProtocolState.HANDSHAKE
+        self.buffered_reader = BufferedProtocolReader()
+        self.handler = {ProtocolState.HANDSHAKE: {0: self.handle_handshake}}
+
+    async def send(self, data: bytes):
+        self.writer.write(data)
+        await self.writer.drain()
+
+    async def dispatch(self, packet_content: bytes) -> None:
+        """
+        packet_content: raw packet content, including packet_id
+        """
+        self.buffered_reader.fill(packet_content)
+        packet_id = self.buffered_reader.read_varint()
+        await self.handler[self.protocol_state][packet_id](self.buffered_reader)
+
+    async def handle_handshake(self, buffer: BufferedProtocolReader):
+        packet = HandshakePacket.from_bytes_io(buffer)
+        self.protocol_state = packet.next_state
